@@ -1,0 +1,117 @@
+# Build the Windows Vulkan loader and attach it to the matching release.
+#
+# WHY THIS REPO HAS A WORKFLOW AND THE LINUX ARTIFACT DID NOT
+#
+# The linux payload was built by hand, in an xlings subos, so that it links
+# our glibc rather than the host's (`.agents/tools/graphics/build-in-subos.sh`
+# in xim-pkgindex). Windows has no equivalent problem and no equivalent
+# machine: there is nothing to seal it against, and nobody here has a Windows
+# box to build on. A runner is the honest way to produce it.
+#
+# WHAT IT IS FOR
+#
+# `vulkan-1.dll` is the Vulkan ICD loader. On Windows it is not an OS
+# component -- it arrives with a GPU driver, or with LunarG's Vulkan Runtime
+# redistributable, or bundled beside an application. It is Apache-2.0 and
+# redistributing it is the ordinary arrangement, which is what the Runtime
+# redistributable exists for.
+#
+# So a machine without a GPU driver has no loader at all, and anything that
+# links `vulkan-1.lib` dies at process start with 0xC0000135
+# (STATUS_DLL_NOT_FOUND) before `main`. That is not hypothetical: it is how
+# `vulkan`, `eui-neo-vulkan` and `vulkan-hpp-module` fail on a
+# `windows-2022` runner in mcpp-index, while passing on images that happen to
+# carry a driver. Shipping the loader as a payload takes the image out of the
+# question.
+#
+# The loader still finds ICDs through the registry, so a driverless machine
+# enumerates no devices -- correct, and enough: loader-level calls such as
+# `vkEnumerateInstanceVersion` are answered by the loader alone.
+name: build-windows
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Loader version, e.g. 1.4.313 (tag becomes vulkan-sdk-<version>.0)"
+        required: true
+        default: "1.4.313"
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - name: Clone Vulkan-Loader at the tag
+        shell: bash
+        run: |
+          v="${{ inputs.version }}"
+          git clone --depth 1 --branch "vulkan-sdk-${v}.0" \
+            https://github.com/KhronosGroup/Vulkan-Loader.git src
+          git -C src log -1 --format="%H %d"
+
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+
+      # Vulkan-Loader needs Vulkan-Headers, and upstream's own script is what
+      # pins the matching revision. Building against whatever headers happen to
+      # be on the machine is how a loader ends up advertising a version its
+      # trampolines do not implement.
+      - name: Fetch upstream's pinned dependencies
+        shell: bash
+        run: python src/scripts/update_deps.py --dir src/external --arch x64 --config release
+
+      - name: Configure and build
+        shell: bash
+        run: |
+          cmake -S src -B build -A x64 \
+            -C src/external/helper.cmake \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTS=OFF \
+            -DUPDATE_DEPS=OFF
+          cmake --build build --config Release --parallel
+
+      # The layout mirrors what a Windows consumer expects and what the xim
+      # recipe's windows branch reads: the DLL in bin/, the import library in
+      # lib/. The linux payload puts its .so in lib/ for the same reason --
+      # each platform's own convention, not a shared one.
+      - name: Stage and verify
+        shell: pwsh
+        run: |
+          $v = "${{ inputs.version }}"
+          $root = "vulkan-loader-$v"
+          New-Item -ItemType Directory -Force -Path "$root\bin","$root\lib" | Out-Null
+
+          $dll = Get-ChildItem -Recurse -Filter vulkan-1.dll build | Select-Object -First 1
+          $lib = Get-ChildItem -Recurse -Filter vulkan-1.lib build | Select-Object -First 1
+          if (-not $dll) { throw "vulkan-1.dll was not produced" }
+          if (-not $lib) { throw "vulkan-1.lib was not produced" }
+          Copy-Item $dll.FullName "$root\bin\vulkan-1.dll"
+          Copy-Item $lib.FullName "$root\lib\vulkan-1.lib"
+
+          # An artifact that exists is not an artifact that works. A
+          # driverless runner cannot create an instance, but it can load the
+          # DLL and ask for the entry point every consumer reaches first --
+          # which is the whole surface `compat.vulkan`'s test asserts.
+          Add-Type -Namespace P -Name K -MemberDefinition '[DllImport("kernel32", SetLastError=true)] public static extern IntPtr LoadLibrary(string p); [DllImport("kernel32")] public static extern IntPtr GetProcAddress(IntPtr h, string n);'
+          $mod = [P.K]::LoadLibrary((Resolve-Path "$root\bin\vulkan-1.dll").Path)
+          if ($mod -eq [IntPtr]::Zero) { throw "the staged vulkan-1.dll does not load" }
+          foreach ($sym in @("vkEnumerateInstanceVersion","vkCreateInstance","vkGetInstanceProcAddr")) {
+            if ([P.K]::GetProcAddress($mod, $sym) -eq [IntPtr]::Zero) {
+              throw "the staged loader does not export $sym"
+            }
+            Write-Host "  exports $sym"
+          }
+
+          Compress-Archive -Path $root -DestinationPath "vulkan-loader-$v-windows-x86_64.zip" -Force
+          (Get-FileHash "vulkan-loader-$v-windows-x86_64.zip" -Algorithm SHA256).Hash.ToLower() |
+            Tee-Object -FilePath sha256.txt
+          Get-Content sha256.txt
+
+      - name: Attach to the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          v="${{ inputs.version }}"
+          gh release upload "$v" "vulkan-loader-$v-windows-x86_64.zip" --clobber --repo "$GITHUB_REPOSITORY"
+          echo "sha256: $(cat sha256.txt)"
