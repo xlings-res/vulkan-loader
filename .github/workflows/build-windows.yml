@@ -37,6 +37,13 @@ on:
         required: true
         default: "1.4.313"
 
+# The job attaches an asset to a release, which the default token cannot do
+# at read scope -- the upload comes back `HTTP 403: Resource not accessible by
+# integration` AFTER a successful build, which is the expensive place to find
+# out. Declared at workflow level so a second job cannot forget it.
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: windows-2022
